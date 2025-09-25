@@ -1,12 +1,12 @@
-from models import OpenAIModel
+from models import AzureOpenAIModel, AzureOpenAIAPIConfig
+from cwe_model import 
 
 def test_openai_model():
-    model = OpenAIModel()
-    messages = [
-        {"role": "system", "content": "You are a professional scientist."},
-        {"role": "user", "content": "Describe the P not equal NP problem."},
-    ]
-    gen = model.completition(messages)
+    config = AzureOpenAIAPIConfig(deployment="gpt-5")
+    model = AzureOpenAIModel(config)
+    gen = model.completion("Describe the P not equal NP problem.")
+    print(gen)
+    gen = model.completion("Output something.")
     print(gen)
 
 

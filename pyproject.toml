@@ -1,0 +1,15 @@
+[project]
+name = "llm-agent-python"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.10.1",
+    "boto3>=1.40.33",
+    "datasets",
+    "jinja2>=3.1.6",
+    "openai>=1.108.0",
+    "torch>=2.8.0",
+    "transformers>=4.56.1",
+]

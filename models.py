@@ -16,14 +16,14 @@ class AbstractConfig(ABC):
 
 class AbstractPromptBuilder(ABC):
    @abstractmethod
-   def build_prompt():
+   def build_prompt(self):
       pass
 
 class AbstractModel(ABC):
   builder: AbstractPromptBuilder
 
   @abstractmethod
-  def completion(self, chat: dict) -> dict:
+  def completion(self, chat: dict) -> str:
     pass
 
 class AbstractAgentModel(AbstractModel, ABC):
@@ -46,6 +46,7 @@ class AzureOpenAIAPIConfig(AbstractConfig):
   api_version: str = os.getenv("AZURE_OPENAI_API_VERSION", "2025-03-01-preview")
   deployment: str = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5")
 
+  @staticmethod
   def add_arguments(parser: ArgumentParser):
       # TODO: remove duplication
       parser.add_argument("--azure-endpoint", type=str, default=os.getenv("AZURE_OPENAI_API_ENDPOINT"))
@@ -64,8 +65,8 @@ class BedrockAPIConfig(AbstractConfig):
   api_token: str
 
 
-class SimplePromptBuilder(AbstractPromptBuilder):
-   def build_prompt(message: str):
+class OpenAIPromptBuilder(AbstractPromptBuilder):
+   def build_prompt(self, message: str):
       messages = [
         {"role": "user", "content": message}
       ]
@@ -85,11 +86,11 @@ class FilePromptBuilder(AbstractPromptBuilder):
      return template.render(**context)
 
 class AzureOpenAIModel(AbstractModel):
-  def __init__(self, config: AzureOpenAIAPIConfig, builder: AbstractPromptBuilder = SimplePromptBuilder):
+  def __init__(self, config: AzureOpenAIAPIConfig, builder: AbstractPromptBuilder = OpenAIPromptBuilder()):
     self.config = config
     self.builder = builder
   
-  def completion(self, example, **kwargs) -> dict:
+  def completion(self, example, **kwargs) -> str:
     url = f"{self.config.endpoint.rstrip('/')}/openai/deployments/{self.config.deployment}/chat/completions?api-version={self.config.api_version}"
     payload = {
         "messages": self.builder.build_prompt(example),

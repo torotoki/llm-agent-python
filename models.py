@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import urllib.request
 import urllib.error
+import asyncio
 
 import boto3
 import jinja2
@@ -25,15 +26,15 @@ class AbstractConfig(ABC):
 
 class AbstractPromptBuilder(ABC):
   @abstractmethod
-  def build_text():
+  def build_text(self, text: str | list):
     """ Building the text prompts. """
     raise NotImplementedError
 
-  async def build_tools(self):
+  def build_tools(self):
     """ Optional method for formatting tool calling prompts. """
     pass
 
-  async def use_tools(self):
+  def use_tools(self):
     """ Optional method for actually calling tools. """
     pass
 
@@ -97,32 +98,35 @@ class SimplePromptBuilder(AbstractPromptBuilder):
 class AbstractMCPConfig(ABC):
   url: str
   headers: dict
+  tools: list
 
   @abstractmethod
-  def get_tools(self):
+  def get_tools(self) -> list:
     pass
 
 @dataclass
 class GithubMCPConfig(AbstractConfig):
-  mcp_url = "https://api.githubcopilot.com/mcp/"
+  url = "https://api.githubcopilot.com/mcp/"
   token = os.getenv("GITHUB_MCP_TOKEN")
   if not token:
     raise RuntimeError("Set GITHUB_MCP_TOKEN")
   headers = {"Authorization": f"Bearer {token}"}
-  tools = None
+  tools = []
   
   async def cache_tool_list(self):
     async with streamablehttp_client(
-        url=self.mcp_url,
+        url=self.url,
         headers=self.headers
     ) as (read, write, _sid):
       async with ClientSession(read, write) as mcp:
         await mcp.initialize()
         return (await mcp.list_tools()).tools
     
-  def get_tools(self):
-    if self.tools is None:
-      self.tools = self.cache_tool_list()
+  def get_tools(self) -> list:
+    if len(self.tools) == 0:
+      if DEBUG:
+        print("Load tools from the MCP server...")
+      self.tools = asyncio.run(self.cache_tool_list())
     return self.tools
 
 class BedrockPromptBuilder(AbstractPromptBuilder):
@@ -131,7 +135,6 @@ class BedrockPromptBuilder(AbstractPromptBuilder):
       {"role": "user", "content": [{"text": message}]},
     ]
     return messages
-
 
 class AnthropicBedrockPromptBuilder(AbstractPromptBuilder):
   def __init__(self, mcp_config: AbstractMCPConfig):
@@ -147,7 +150,7 @@ class AnthropicBedrockPromptBuilder(AbstractPromptBuilder):
     ]
     return messages
   
-  async def build_tools(self):
+  def build_tools(self):
     tools = self.mcp_config.get_tools()
     anthropic_tools = [{
       "name": t.name,
@@ -156,6 +159,37 @@ class AnthropicBedrockPromptBuilder(AbstractPromptBuilder):
     } for t in tools]
 
     return anthropic_tools
+
+  async def use_tools(self, response) -> list:
+    tool_uses = [b for b in response.content
+                 if getattr(b, "type", None) == "tool_use"]
+
+    results = []
+    async with streamablehttp_client(
+        url=self.mcp_config.url,
+        headers=self.mcp_config.headers,
+    ) as (read, write, _sid):
+      async with ClientSession(read, write) as mcp:
+        await mcp.initialize()
+
+        for tu in tool_uses:
+          res = await mcp.call_tool(tu.name, tu.input)
+          out = []
+          for c in res.content:
+            typ = getattr(c, "type", None)
+            if typ == "text":
+              out.append(getattr(c, "text", ""))
+            elif typ == "resource":
+              out.append(f"[resource] {getattr(c, 'uri', '')}")
+            else:
+              try:
+                out.append(json.dumps(c if isinstance(c, dict) else c.model_dump()))
+              except Exception:
+                out.append(str(c))
+          results.append({"type": "tool_result", "tool_use_id": tu.id,
+                        "content": "\n".join(out) or "(empty)"})
+
+    return results   
 
 
 class FilePromptBuilder(AbstractPromptBuilder):
@@ -172,25 +206,32 @@ class FilePromptBuilder(AbstractPromptBuilder):
     return template.render(**context)
 
 class AnthropicBedrockModel(AbstractModel):
-  def __init__(self, config: BedrockAPIConfig, builder: AbstractPromptBuilder = SimplePromptBuilder()):
+  def __init__(
+      self,
+      config: BedrockAPIConfig,
+      builder: AbstractPromptBuilder = SimplePromptBuilder()
+  ):
     self.config = config
+    self.builder = builder
     self.client = AnthropicBedrock(aws_region=config.region)
     self.retry = 10
     self.model_id = config.BEDROCK_ALIASES[config.deployment]
   
-  def completion(self, prompt: str, **kwargs):
-    msgs = [{
-       "role": "user",
-       "content": (prompt)
-    }]
+  def completion(self, text: str, **kwargs) -> tuple[list, str]:
+    msgs = []
+    msgs.append(self.builder.build_text(text))
+    tools = self.builder.build_tools()
     resp = self.client.messages.create(
       model=self.model_id,
       messages=msgs,
-      tools=anthropic_tools,
+      tools=tools,
+      **kwargs,
     )
-
-    return resp
-     
+    results = asyncio.run(self.builder.use_tools(resp)) # type: ignore
+    if results:
+      msgs.append(self.builder.build_text(results))
+    sys_out = resp.content[0].text
+    return (msgs, sys_out)
   
 class BedrockModel(AbstractModel):
   def __init__(self, config: BedrockAPIConfig, builder: AbstractPromptBuilder = BedrockPromptBuilder()):

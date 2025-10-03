@@ -1,24 +1,30 @@
 from argparse import ArgumentParser
+import base64
+from io import BytesIO
 import json
 import os
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import urllib.request
 import urllib.error
 import asyncio
+import logging
 
 import boto3
 import jinja2
+import anthropic
 
 from botocore.exceptions import ClientError
 from anthropic import AnthropicBedrock
 from anthropic.types import Message
+from PIL import Image
 
 from mcp.client.streamable_http import streamablehttp_client
 from mcp import ClientSession
 
 DEBUG = 1
+#logging.basicConfig(level=logging.INFO)
 
 @dataclass
 class AbstractConfig(ABC):
@@ -26,13 +32,17 @@ class AbstractConfig(ABC):
 
 class AbstractPromptBuilder(ABC):
   @abstractmethod
-  def build_text(self, text: str | list):
+  def build_text(self, text: str | list, role: str = "user"):
     """ Building the text prompts. """
     raise NotImplementedError
 
   def build_tools(self):
     """ Optional method for formatting tool calling prompts. """
-    pass
+    return []
+  
+  def build_text_image(self, text: str, image: Image.Image):
+    """ Optional method for building text & image prompts. """
+    raise NotImplementedError
 
   def use_tools(self):
     """ Optional method for actually calling tools. """
@@ -96,16 +106,16 @@ class SimplePromptBuilder(AbstractPromptBuilder):
 
 @dataclass
 class AbstractMCPConfig(ABC):
-  url: str
-  headers: dict
-  tools: list
+  url: str = field(init=False)
+  headers: dict = field(init=False)
+  tools: list = field(init=False)
 
   @abstractmethod
   def get_tools(self) -> list:
     pass
 
 @dataclass
-class GithubMCPConfig(AbstractConfig):
+class GithubMCPConfig(AbstractMCPConfig):
   url = "https://api.githubcopilot.com/mcp/"
   token = os.getenv("GITHUB_MCP_TOKEN")
   if not token:
@@ -124,8 +134,7 @@ class GithubMCPConfig(AbstractConfig):
     
   def get_tools(self) -> list:
     if len(self.tools) == 0:
-      if DEBUG:
-        print("Load tools from the MCP server...")
+      logging.info("Load tools from the MCP server...")
       self.tools = asyncio.run(self.cache_tool_list())
     return self.tools
 
@@ -139,15 +148,31 @@ class BedrockPromptBuilder(AbstractPromptBuilder):
 class AnthropicBedrockPromptBuilder(AbstractPromptBuilder):
   def __init__(self, mcp_config: AbstractMCPConfig):
     self.mcp_config = mcp_config
-    #TODO: async をなくしてMCPConfig側からツールのリストを引っ張る
-    #TODO: responseからuse_toolsを行ってmsgに増やす部分を作る
-    #TODO: ライブラリとして独立させてgithubに戻す
-    #このコードを使ったサンプルコードを作る
+    #TODO: このコードを使ったサンプルコードを作る
     
-  def build_text(self, message: str):
-    messages = [
-      {"role": "user", "content": message}
-    ]
+  def build_text(self, message: str, role="user"):
+    messages = {"role": role, "content": message}
+    return messages
+  
+  def build_text_image(self, text: str, image: Image.Image):
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")  # Also supports JPEG
+    img_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    messages = {
+      "role": "user",
+      "content": [
+          {"type": "text", "text": text},
+          {
+              "type": "image",
+              "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": img_str,
+              },
+          },
+      ],
+    }
     return messages
   
   def build_tools(self):
@@ -217,21 +242,47 @@ class AnthropicBedrockModel(AbstractModel):
     self.retry = 10
     self.model_id = config.BEDROCK_ALIASES[config.deployment]
   
-  def completion(self, text: str, **kwargs) -> tuple[list, str]:
-    msgs = []
-    msgs.append(self.builder.build_text(text))
+  def completion(
+      self, text: str | None = None,
+      image: Image.Image | None = None,
+      max_tokens = 16384,
+      output_state = False,
+      state: list | None = None,
+      **kwargs
+  ) -> tuple[list, str]:
+    msgs = [] if state is None else state
+    if image is not None:
+      msgs.append(self.builder.build_text_image(text or "", image))
+    elif text is not None and image is None:
+      msgs.append(self.builder.build_text(text))
     tools = self.builder.build_tools()
-    resp = self.client.messages.create(
-      model=self.model_id,
-      messages=msgs,
-      tools=tools,
-      **kwargs,
-    )
+    retry = self.retry
+    while retry > 0:
+      try:
+        resp = self.client.messages.create(
+          model=self.model_id,
+          messages=msgs,
+          max_tokens=max_tokens,
+          tools=tools,
+          **kwargs,
+        )
+      except anthropic.RateLimitError as e:
+        logging.info("Retrying for RateLimitError:", e)
+        time.sleep(60)
+        retry -= 1
+        continue
+      break
+    msgs.append(self.builder.build_text(resp.content, "assistant"))
     results = asyncio.run(self.builder.use_tools(resp)) # type: ignore
     if results:
       msgs.append(self.builder.build_text(results))
-    sys_out = resp.content[0].text
-    return (msgs, sys_out)
+    sys_out = ""
+    if len(resp.content) > 0:
+      sys_out = resp.content[0].text
+    if output_state:
+      return (msgs, sys_out)
+    else:
+      return sys_out
   
 class BedrockModel(AbstractModel):
   def __init__(self, config: BedrockAPIConfig, builder: AbstractPromptBuilder = BedrockPromptBuilder()):
@@ -242,9 +293,8 @@ class BedrockModel(AbstractModel):
     self.model_id = config.BEDROCK_ALIASES[config.deployment]
 
   def completion(self, prompt: str, **kwargs) -> str:
-    if DEBUG:
-      print("="*80)
-      print(prompt)
+    logging.info("="*80)
+    logging.info(prompt)
     messages = self.builder.build_text(prompt) # type: ignore
     retry = self.retry
     while retry > 0:
@@ -266,9 +316,8 @@ class BedrockModel(AbstractModel):
           continue
         gen = response['output']['message']['content'][0]['text']
         break
-    if DEBUG:
-      print(gen)
-      print("="*80)
+    logging.info(gen)
+    logging.info("="*80)
     return gen
 
 class AzureOpenAIModel(AbstractModel):
